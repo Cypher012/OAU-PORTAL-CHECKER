@@ -8,15 +8,20 @@ Private Telegram bot that checks your OAU eportal results. Runs on Cloudflare Wo
 - `/login`: connect your portal account. The bot asks for your matric number and password in the chat, then deletes the password message.
 - `/logout`: sign out and delete the saved password
 - `/cancel`: cancel a login or PIN prompt
-- `/results`: asks for your PIN, then lets you pick a semester from buttons and view its courses and SGPA
+- `/clear`: delete tracked incoming and outgoing messages from the private chat while Telegram still permits deletion
+- `/setpin`: create or change the PIN inside the private bot chat
+- `/analytics`: asks for your PIN, then sends an SGPA and cumulative-CGPA trend chart with performance statistics
+- `/compare`: asks for your PIN, then compares every semester's SGPA, cumulative CGPA, and CGPA movement
+- `/report`: asks for your PIN, then generates a downloadable PDF with the GPA trend, semester comparison, and complete results
+- `/results`: asks for your PIN, then lets you pick a semester from buttons and view its courses, SGPA, and cumulative CGPA at that point
 - `/summary`: asks for your PIN, then shows CGPA, units attempted and passed, and failed courses
 
 - `/refresh`: fetch the latest results from the portal now
 - `/status`: login state, auto re-login state, when results were last fetched, and the result of the last automatic check
 
-Results are cached in a SQLite-backed Durable Object and refreshed every 15 minutes by the automatic check, so `/results` and `/summary` can be up to 15 minutes old. Use `/refresh` for the latest data. Large semesters have Previous/Next buttons. Result buttons expire five minutes after PIN authorization.
+Results are cached in a SQLite-backed Durable Object and refreshed every 15 minutes by the automatic check, so protected views can be up to 15 minutes old. Use `/refresh` for the latest data. Large semesters have Previous/Next buttons. Result buttons expire five minutes after PIN authorization. Update alerts identify added, changed, or removed courses and show the resulting semester-GPA and current-CGPA movement.
 
-The bot only accepts the owner's private chat. Login and PIN prompts cancel incompatible conversations. Passwords preserve whitespace and slash prefixes; `/cancel`, `/logout`, and `/login` are reserved during password entry.
+The bot only accepts the owner's private chat. Login and PIN prompts cancel incompatible conversations. Passwords preserve whitespace and slash prefixes; `/cancel`, `/clear`, `/logout`, `/login`, and `/setpin` are reserved during password entry. PIN messages are deleted after reading, and only a keyed digest is stored. `/clear` silently removes tracked messages and sweeps up to 1,000 recent message IDs in the private chat. Telegram still prevents the bot from deleting messages outside its 48-hour deletion window.
 
 ## How login works
 
@@ -25,6 +30,8 @@ After `/login`, the bot stays logged in. Your password is saved encrypted with A
 Webhook updates are encrypted and durably queued before Telegram receives success. A Durable Object alarm processes one update or scheduled check at a time, keeping portal work out of the HTTP background execution limit. Recent duplicate update IDs are ignored. Notification batches are split into bounded messages and retain progress when a later message fails. A process crash after Telegram accepts a message but before delivery progress is saved can still duplicate that message on retry.
 
 Pending or unrecognized grades are displayed but excluded from GPA and passed-unit calculations. The existing elective and semester-label assumptions remain; verify these against your official results before treating the calculated GPA as authoritative.
+
+Analytics charts are rendered by QuickChart. Only semester labels and aggregate SGPA and CGPA values are sent for rendering; matric numbers, course titles, and raw scores are not included.
 
 Limits to know about:
 
@@ -56,7 +63,7 @@ Limits to know about:
    openssl rand -base64 32 # ENCRYPTION_KEY
    ```
 
-   Edit `.dev.vars` and replace all five placeholders with your BotFather token, numeric Telegram user ID, generated secrets, and chosen PIN. `.dev.vars` is gitignored; keep its values private.
+   Edit `.dev.vars` and replace all four placeholders with your BotFather token, numeric Telegram user ID, and generated secrets. `.dev.vars` is gitignored; keep its values private.
 
 5. Deploy:
 
@@ -68,7 +75,7 @@ Limits to know about:
 
 6. Check that the CLI prints `Telegram webhook registered` after deployment. No manual curl command is needed.
 
-7. In the chat with your bot, send `/login` and follow the prompts. This also saves the password for automatic re-login.
+7. In the chat with your bot, send `/setpin` to create your private results PIN, then send `/login` and follow the prompts. Login saves the password for automatic re-login. You can also create the PIN when `/results` or `/summary` first asks for it.
 
 Wrangler creates the Durable Object binding and applies the `v1` SQLite migration during deployment. No KV namespace is required. Existing KV data is not migrated or deleted; after upgrading from the KV version, send `/login` again. Automatic webhook registration sets `max_connections=1` to preserve conversational delivery order.
 

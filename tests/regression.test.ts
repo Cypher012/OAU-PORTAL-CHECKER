@@ -1,13 +1,16 @@
 import { afterEach, expect, test } from "bun:test";
 import type { Update } from "grammy/types";
+import { PDFDocument } from "pdf-lib";
+import { analyzeResults, analyticsChartRequest, formatAnalytics, renderAnalyticsChart } from "../src/analytics";
 import { createBot } from "../src/bot";
 import { loadResults } from "../src/cache";
-import { decrypt, encrypt } from "../src/crypto";
-import { semesterPages } from "../src/format";
-import { gpa, summarize } from "../src/grades";
+import { decrypt, digestPin, encrypt } from "../src/crypto";
+import { formatSemesterComparison, semesterPages } from "../src/format";
+import { gpa, semesterProgress, summarize } from "../src/grades";
 import { Inbox } from "../src/inbox";
 import { checkForNewResults, diff, flatten, formatChanges } from "../src/notify";
 import { login, normalizeResults } from "../src/portal";
+import { generateAcademicReport } from "../src/report";
 import { ACCOUNT_STATE_KEYS, DurableStateStore } from "../src/state";
 import { isOwnerUpdate, processUpdate } from "../src/updates";
 import type { BotEnv, Course } from "../src/types";
@@ -48,14 +51,16 @@ afterEach(() => { globalThis.fetch = originalFetch; });
 async function setup(seed: Record<string, unknown> = {}) {
   const storage = new MemoryStorage();
   const state = new DurableStateStore(storage as unknown as DurableObjectStorage);
-  for (const [k, v] of Object.entries(seed)) await state.put(k, JSON.stringify(v));
-  const env: BotEnv = { STATE: state, BOT_TOKEN: "123:dummy", OWNER_ID: "42", WEBHOOK_SECRET: "dummy", PIN: "1234", ENCRYPTION_KEY: key };
+  for (const [k, v] of Object.entries(seed)) await state.put(k, typeof v === "string" ? v : JSON.stringify(v));
+  const env: BotEnv = { STATE: state, BOT_TOKEN: "123:dummy", OWNER_ID: "42", WEBHOOK_SECRET: "dummy", ENCRYPTION_KEY: key };
   const bot = createBot(env);
   const calls: { method: string; payload: any }[] = [];
   bot.api.config.use(async (_previous, method, payload) => {
     calls.push({ method, payload });
     return { ok: true, result: method === "getMe" ? { id: 123, is_bot: true, first_name: "Test", username: "test_bot" }
-      : method === "sendMessage" ? { message_id: 77, date: 0, chat: { id: 42, type: "private" }, text: payload.text } : true } as any;
+      : method === "sendMessage" ? { message_id: 77, date: Math.floor(Date.now() / 1000), chat: { id: 42, type: "private" }, text: payload.text }
+      : method === "sendPhoto" ? { message_id: 78, date: Math.floor(Date.now() / 1000), chat: { id: 42, type: "private" }, photo: [] }
+      : method === "sendDocument" ? { message_id: 79, date: Math.floor(Date.now() / 1000), chat: { id: 42, type: "private" }, document: {} } : true } as any;
   });
   return { storage, state, env, bot, calls };
 }
@@ -63,7 +68,7 @@ async function setup(seed: Record<string, unknown> = {}) {
 let updateId = 0;
 function message(text: string, group = false, sender = 42): Update {
   return { update_id: ++updateId, message: {
-    message_id: updateId, date: 0, from: { id: sender, is_bot: false, first_name: "Owner" },
+    message_id: updateId, date: Math.floor(Date.now() / 1000), from: { id: sender, is_bot: false, first_name: "Owner" },
     chat: group ? { id: -100, type: "supergroup", title: "Group" } : { id: 42, type: "private", first_name: "Owner" }, text,
     ...(text.startsWith("/") ? { entities: [{ type: "bot_command" as const, offset: 0, length: text.split(" ")[0].length }] } : {}),
   } };
@@ -124,8 +129,46 @@ test("starting login cancels a pending PIN prompt", async () => {
   expect(calls.some(c => c.payload.text?.startsWith("Wrong PIN"))).toBe(false);
 });
 
+test("clear sweeps prior message IDs and tracked history in batches", async () => {
+  const date = Math.floor(Date.now() / 1000);
+  const tracked = [{ id: 77, date }, ...Array.from({ length: 205 }, (_, index) => ({ id: index + 1000, date }))];
+  const { bot, state, calls } = await setup({ message_history: tracked });
+  const clear = message("/clear");
+  await processUpdate(bot, clear);
+  const deletions = calls.filter(c => c.method === "deleteMessages");
+  const deleted = deletions.flatMap(c => c.payload.message_ids);
+  expect(deletions).toHaveLength(3);
+  expect(deletions.every(c => c.payload.message_ids.length <= 100)).toBe(true);
+  expect(deleted).toContain(clear.message!.message_id);
+  expect(deleted).toContain(clear.message!.message_id - 1);
+  expect(deleted).toContain(77);
+  expect(deleted).toContain(1204);
+  expect(await state.get("message_history")).toBeNull();
+});
+
+test("first protected command creates the PIN inside Telegram", async () => {
+  const { bot, state, calls } = await setup({ session, results: cache });
+  await processUpdate(bot, message("/results"));
+  await processUpdate(bot, message("1234"));
+  const stored = await state.get("pin_digest");
+  expect(stored).toBe(await digestPin(key, "1234"));
+  expect(stored).not.toContain("1234");
+  expect(calls.some(c => c.method === "deleteMessage")).toBe(true);
+  expect(calls.some(c => c.method === "sendMessage" && c.payload.text === "PIN saved. Loading your semester results now.")).toBe(true);
+  expect(calls.some(c => c.method === "sendMessage" && c.payload.text.startsWith("Pick a semester"))).toBe(true);
+});
+
+test("PIN setup rejects invalid values without ending the prompt", async () => {
+  const { bot, state, calls } = await setup();
+  await processUpdate(bot, message("/setpin"));
+  await processUpdate(bot, message("12ab"));
+  expect(await state.get("pin_digest")).toBeNull();
+  expect(await state.get("pin_state", "json")).toEqual({ action: "set" });
+  expect(calls.some(c => c.payload.text?.startsWith("PIN must contain"))).toBe(true);
+});
+
 test("password whitespace and slash prefixes survive login; old account data is reset", async () => {
-  const { bot, state } = await setup({ login_state: { step: "password", username: "TEST/2000/000" }, session, results: cache, snapshot: {} });
+  const { bot, state, calls } = await setup({ login_state: { step: "password", username: "TEST/2000/000" }, session, results: cache, snapshot: {} });
   let sentPassword: string | undefined;
   globalThis.fetch = (async (url, init) => {
     if (String(url).endsWith("/api/login")) {
@@ -141,6 +184,7 @@ test("password whitespace and slash prefixes survive login; old account data is 
   expect((await state.get<any>("session", "json"))?.studentId).toBe(2);
   const encrypted = await state.get<any>("credentials", "json");
   expect(JSON.parse(await decrypt(key, encrypted)).password).toBe("/secret ");
+  expect(calls.some(c => c.payload.text?.includes("/refresh") && c.payload.text?.includes("/results"))).toBe(true);
 });
 
 test("credential encryption failure cannot replace the active account", async () => {
@@ -154,7 +198,7 @@ test("credential encryption failure cannot replace the active account", async ()
 });
 
 test("valid PIN grants access to its picker; expired authorization denies navigation", async () => {
-  const { bot, state, calls } = await setup({ session, results: cache });
+  const { bot, state, calls } = await setup({ session, results: cache, pin_digest: await digestPin(key, "1234") });
   await processUpdate(bot, message("/results"));
   await processUpdate(bot, message("1234"));
   await processUpdate(bot, callback());
@@ -186,6 +230,104 @@ test("numeric strings are normalized and pending grades do not corrupt GPA", () 
   expect(() => normalizeResults({ result: { "121": [{ course_code: "A", course_title: "B", credit_unit: "bad" }] } })).toThrow();
 });
 
+test("analytics calculates chronological GPA trends and performance extremes", () => {
+  const results = {
+    "122": [
+      { ...course, code: "CSC202", score: 65, grade: "B" },
+      { ...course, code: "MTH202", score: 55, grade: "C" },
+    ],
+    "121": [
+      { ...course, code: "CSC201", score: 75, grade: "A" },
+      { ...course, code: "MTH201", score: 65, grade: "B" },
+      { ...course, code: "SEA001", score: 0, grade: "F" },
+    ],
+  };
+  const analytics = analyzeResults(results);
+  expect(analytics.trend.map(point => point.key)).toEqual(["121", "122"]);
+  expect(analytics.trend.map(point => point.sgpa)).toEqual([4.5, 3.5]);
+  expect(analytics.currentCgpa).toBe(4);
+  expect(analytics.peakCgpa?.cgpa).toBe(4.5);
+  expect(analytics.highestSgpa?.key).toBe("121");
+  expect(analytics.lowestSgpa?.key).toBe("122");
+  expect(analytics.latestChange).toBe(-1);
+  expect(analytics.averageScore).toBe(65);
+  expect(analytics.highestScore).toEqual({ code: "CSC201", score: 75 });
+  expect(analytics.lowestScore).toEqual({ code: "MTH202", score: 55 });
+  expect(analytics.gradeDistribution).toEqual({ A: 1, B: 2, C: 1, D: 0, E: 0, F: 0 });
+  const formatted = formatAnalytics({
+    ...analytics,
+    gradeDistribution: { A: 24, B: 8, C: 0, D: 0, E: 2, F: 1 },
+  });
+  expect(formatted).toContain("CGPA ATH");
+  expect(formatted).toContain("Grade Count   Share  Distribution");
+  expect(formatted).toContain("A        24   68.6%  ########");
+  expect(formatted).toContain("C         0    0.0%");
+  expect(formatted.length).toBeLessThan(1024);
+  expect(analyticsChartRequest(analytics).chart.data.datasets).toHaveLength(2);
+});
+
+test("semester results and comparison expose cumulative CGPA at every endpoint", () => {
+  const results = {
+    "121": [{ ...course, code: "CSC101", score: 75, grade: "A" }],
+    "122": [{ ...course, code: "CSC102", score: 65, grade: "B" }],
+  };
+  const progress = semesterProgress(results);
+  expect(progress.map(semester => semester.cgpa)).toEqual([5, 4.5]);
+  expect(progress[1]).toMatchObject({ units: 3, points: 12, cumulativeUnits: 6, cumulativePoints: 27 });
+  const semester = semesterPages("122", results["122"], results)[0];
+  expect(semester).toContain("SGPA: <b>4.00</b>");
+  expect(semester).toContain("CGPA after semester: <b>4.50</b>");
+  expect(semester).toContain("27.0 cumulative points / 6 units");
+  const comparison = formatSemesterComparison(results);
+  expect(comparison).toContain("Semester Comparison");
+  expect(comparison).toContain("CGPA ATH: <b>5.00</b> after 100L · 1st Semester");
+  expect(comparison).toContain("-0.50");
+});
+
+test("analytics chart uses aggregate data and validates the PNG response", async () => {
+  const analytics = analyzeResults({ "121": [course] });
+  let requestBody: any;
+  const image = await renderAnalyticsChart(analytics, (async (_url, init) => {
+    requestBody = JSON.parse(init!.body as string);
+    return new Response(new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), { headers: { "Content-Type": "image/png" } });
+  }) as typeof fetch);
+  expect([...image]).toEqual([137, 80, 78, 71, 13, 10, 26, 10]);
+  expect(JSON.stringify(requestBody)).not.toContain(course.title);
+  expect(requestBody.chart.data.datasets[0].data).toEqual([5]);
+  await expect(renderAnalyticsChart(analytics, (async () => new Response("failed", { status: 503 })) as typeof fetch)).rejects.toThrow("Chart rendering failed");
+});
+
+test("analytics is PIN protected and sends a chart with statistics", async () => {
+  const { bot, calls } = await setup({ session, results: cache, pin_digest: await digestPin(key, "1234") });
+  globalThis.fetch = (async () => new Response(new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), { headers: { "Content-Type": "image/png" } })) as typeof fetch;
+  await processUpdate(bot, message("/analytics"));
+  await processUpdate(bot, message("1234"));
+  expect(calls.some(c => c.method === "sendPhoto" && c.payload.caption.includes("Academic Analytics"))).toBe(true);
+});
+
+test("comparison and PDF report are PIN protected", async () => {
+  const results = { "121": [course], "122": [{ ...course, code: "CSC202", score: 65, grade: "B" }] };
+  const { bot, calls } = await setup({ session, results: { ...cache, results }, pin_digest: await digestPin(key, "1234") });
+  await processUpdate(bot, message("/compare"));
+  await processUpdate(bot, message("1234"));
+  expect(calls.some(c => c.method === "sendMessage" && c.payload.text.includes("Semester Comparison"))).toBe(true);
+  await processUpdate(bot, message("/report"));
+  await processUpdate(bot, message("1234"));
+  expect(calls.some(c => c.method === "sendDocument" && c.payload.caption.includes("Academic report"))).toBe(true);
+});
+
+test("academic report is a readable multipage PDF", async () => {
+  const results = {
+    "121": [course],
+    "122": [{ ...course, code: "SEA001", title: "Elective", score: 61, grade: "B" }],
+  };
+  const bytes = await generateAcademicReport(results, new Date("2026-10-16T12:00:00Z"));
+  expect(new TextDecoder().decode(bytes.slice(0, 5))).toBe("%PDF-");
+  const report = await PDFDocument.load(bytes);
+  expect(report.getPageCount()).toBeGreaterThanOrEqual(3);
+  expect(report.getTitle()).toBe("OAU Portal Academic Report");
+});
+
 test("large semester tables paginate and retain the full-semester GPA", () => {
   const courses = Array.from({ length: 200 }, (_, i) => ({ ...course, code: `CSC${i + 200}`, title: "<&>".repeat(30), grade: i % 2 ? "B" : "A" }));
   const pages = semesterPages("121", courses);
@@ -204,6 +346,17 @@ test("removals and metadata corrections are detected and formatted safely", () =
   expect(diff(previous, flatten({ "121": [{ ...course, unit: 4 }] }))).toHaveLength(1);
   const changes = diff({}, flatten({ "121": Array.from({ length: 200 }, (_, i) => ({ ...course, code: `CSC${i}`, title: "<&>".repeat(100) })) }));
   for (const text of formatChanges(changes)) expect(text.length).toBeLessThan(4096);
+});
+
+test("result alerts explain semester and cumulative GPA impact", () => {
+  const previousResults = { "121": [{ ...course, score: 65, grade: "B" }] };
+  const currentResults = { "121": [{ ...course, score: 75, grade: "A" }] };
+  const changes = diff(flatten(previousResults), flatten(currentResults));
+  const alert = formatChanges(changes, previousResults, currentResults).join("\n");
+  expect(alert).toContain("changed from 65 (B), 3 units to 75 (A), 3 units");
+  expect(alert).toContain("Calculated GPA impact");
+  expect(alert).toContain("100L · 1st Semester SGPA: 4.00 -&gt; 5.00 (+1.00)");
+  expect(alert).toContain("Current CGPA: 4.00 -&gt; 5.00 (+1.00)");
 });
 
 test("failed notification chunk resumes after already-delivered chunks", async () => {

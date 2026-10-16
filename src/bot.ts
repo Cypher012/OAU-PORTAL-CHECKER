@@ -1,13 +1,16 @@
-import { Bot, GrammyError, type Context } from "grammy/web";
+import { Bot, GrammyError, InputFile, type Context } from "grammy/web";
+import { analyzeResults, formatAnalytics, renderAnalyticsChart } from "./analytics";
 import { loadResults, refreshResults } from "./cache";
 import {
   hasCredentials,
   prepareCredentials,
   saveAccount,
 } from "./credentials";
-import { escapeHtml, semesterPages, formatSummary } from "./format";
+import { escapeHtml, formatSemesterComparison, semesterPages, formatSummary } from "./format";
 import { semesterLabel } from "./grades";
+import { digestPin } from "./crypto";
 import { login } from "./portal";
+import { generateAcademicReport } from "./report";
 import { ACCOUNT_STATE_KEYS } from "./state";
 import type {
   CachedResults,
@@ -15,6 +18,7 @@ import type {
   LastCheck,
   LoginState,
   PinState,
+  ProtectedAction,
   Results,
   Session,
   ResultAccess,
@@ -25,6 +29,11 @@ const HELP = [
   "",
   "/login - connect your OAU portal account",
   "/logout - sign out and delete the saved password",
+  "/clear - delete recent messages from this chat",
+  "/setpin - create or change your results PIN",
+  "/analytics - GPA trends and performance statistics",
+  "/compare - compare SGPA and cumulative CGPA by semester",
+  "/report - download a complete academic PDF report",
   "/results - pick a semester to view (asks for PIN)",
   "/summary - CGPA and unit totals (asks for PIN)",
   "/refresh - fetch the latest results from the portal now",
@@ -42,6 +51,14 @@ const LOGIN_TIMEOUT_SECONDS = 600;
 /** A PIN prompt expires after 2 minutes if nothing is entered. */
 const PIN_TIMEOUT_SECONDS = 120;
 const ACCESS_TIMEOUT_SECONDS = 300;
+const MESSAGE_DELETE_WINDOW_SECONDS = 48 * 60 * 60;
+const MESSAGE_HISTORY_LIMIT = 1000;
+const MESSAGE_SWEEP_LIMIT = 1000;
+
+interface TrackedMessage {
+  id: number;
+  date: number;
+}
 
 function semesterKeyboard(results: Results) {
   const keys = Object.keys(results).sort((a, b) => Number(a) - Number(b));
@@ -77,22 +94,55 @@ export function createBot(env: BotEnv): Bot {
   const bot = new Bot(env.BOT_TOKEN, { client: { timeoutSeconds: 10 } });
   const ownerId = Number(env.OWNER_ID);
 
+  async function rememberMessage(id: number, date: number) {
+    const cutoff = Math.floor(Date.now() / 1000) - MESSAGE_DELETE_WINDOW_SECONDS;
+    const history = await env.STATE.get<TrackedMessage[]>("message_history", "json") ?? [];
+    const retained = history.filter((message) => message.date > cutoff && message.id !== id);
+    retained.push({ id, date });
+    await env.STATE.put("message_history", JSON.stringify(retained.slice(-MESSAGE_HISTORY_LIMIT)));
+  }
+
+  bot.api.config.use(async (previous, method, payload, signal) => {
+    const response = await previous(method, payload, signal);
+    if ((method === "sendMessage" || method === "sendPhoto" || method === "sendDocument") && response.ok) {
+      const message = response.result as { message_id: number; date: number };
+      await rememberMessage(message.message_id, message.date);
+    }
+    return response;
+  });
+
   // Private bot: silently ignore everyone except the owner.
   bot.use(async (ctx, next) => {
     if (ctx.from?.id === ownerId && ctx.chat?.type === "private" && ctx.chat.id === ownerId) await next();
   });
 
-  async function askPin(ctx: Context, action: PinState["action"]) {
+  bot.use(async (ctx, next) => {
+    if (ctx.message) await rememberMessage(ctx.message.message_id, ctx.message.date);
+    await next();
+  });
+
+  async function askPin(ctx: Context, target: ProtectedAction) {
     await env.STATE.delete("login_state");
     await env.STATE.delete("result_access");
+    const configured = await env.STATE.get("pin_digest");
+    const state: PinState = configured
+      ? { action: "verify", target }
+      : { action: "set", target };
     await env.STATE.put(
       "pin_state",
-      JSON.stringify({ action } satisfies PinState),
+      JSON.stringify(state),
       {
         expirationTtl: PIN_TIMEOUT_SECONDS,
       },
     );
-    await ctx.reply("Enter your PIN.");
+    const destination = target === "results" ? "semester results"
+      : target === "summary" ? "academic summary"
+      : target === "analytics" ? "academic trend"
+      : target === "compare" ? "semester comparison"
+      : "academic report";
+    await ctx.reply(configured
+      ? "Enter your PIN."
+      : `Create a 4 to 12 digit PIN. I'll continue to your ${destination} after saving it.`);
   }
 
   async function showResults(ctx: Context) {
@@ -114,6 +164,50 @@ export function createBot(env: BotEnv): Bot {
     });
   }
 
+  async function showAnalytics(ctx: Context) {
+    const { results } = await loadResults(env);
+    const analytics = analyzeResults(results);
+    const caption = formatAnalytics(analytics);
+    try {
+      const chart = await renderAnalyticsChart(analytics);
+      await ctx.replyWithPhoto(new InputFile(chart, "academic-trend.png"), {
+        caption,
+        parse_mode: "HTML",
+        reply_markup: DELETE_KEYBOARD,
+      });
+    } catch {
+      await ctx.reply(`${caption}\n\n<i>The chart is temporarily unavailable. Send /analytics to try it again.</i>`, {
+        parse_mode: "HTML",
+        reply_markup: DELETE_KEYBOARD,
+      });
+    }
+  }
+
+  async function showComparison(ctx: Context) {
+    const { results } = await loadResults(env);
+    await ctx.reply(formatSemesterComparison(results), {
+      parse_mode: "HTML",
+      reply_markup: DELETE_KEYBOARD,
+    });
+  }
+
+  async function showReport(ctx: Context) {
+    const { results, fetchedAt } = await loadResults(env);
+    const report = await generateAcademicReport(results);
+    await ctx.replyWithDocument(new InputFile(report, "oau-academic-report.pdf"), {
+      caption: `Academic report generated from portal data refreshed ${formatTime(fetchedAt)}.`,
+      reply_markup: DELETE_KEYBOARD,
+    });
+  }
+
+  async function showProtected(ctx: Context, target: ProtectedAction) {
+    if (target === "results") await showResults(ctx);
+    else if (target === "summary") await showSummary(ctx);
+    else if (target === "analytics") await showAnalytics(ctx);
+    else if (target === "compare") await showComparison(ctx);
+    else await showReport(ctx);
+  }
+
   async function completeLogin(ctx: Context, state: Extract<LoginState, { step: "password" }>, password: string) {
     await env.STATE.delete("login_state");
     await ctx.deleteMessage().catch(() => {});
@@ -121,16 +215,15 @@ export function createBot(env: BotEnv): Bot {
       const payload = await prepareCredentials(env, { username: state.username, password });
       const session = await login(state.username, password);
       await saveAccount(env, session, payload);
-      await ctx.reply("Logged in. I'll stay logged in until you send /logout.");
+      await ctx.reply("Logged in. Next, send /refresh to fetch your latest results, then use /results to browse by semester, /compare for the cumulative breakdown, or /analytics for performance trends.");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await ctx.reply(`Login failed: ${escapeHtml(message)}. Send /login to try again.`, { parse_mode: "HTML" });
     }
   }
 
-  // Passwords are raw text, including whitespace and slash prefixes. These three commands cancel entry.
   bot.use(async (ctx, next) => {
-    if (!ctx.message?.text || /^\/(?:cancel|logout|login)(?:@\w+)?\s*$/.test(ctx.message.text)) return next();
+    if (!ctx.message?.text || /^\/(?:cancel|clear|logout|login|setpin)(?:@\w+)?\s*$/.test(ctx.message.text)) return next();
     const state = await env.STATE.get<LoginState>("login_state", "json");
     if (state?.step === "password") await completeLogin(ctx, state, ctx.message.text);
     else await next();
@@ -140,7 +233,24 @@ export function createBot(env: BotEnv): Bot {
 
   bot.command("cancel", async (ctx) => {
     await env.STATE.write({}, ["login_state", "pin_state", "result_access"]);
-    await ctx.reply("Canceled.");
+    await ctx.reply("Canceled. Send /start to see the available commands.");
+  });
+
+  bot.command("clear", async (ctx) => {
+    const cutoff = Math.floor(Date.now() / 1000) - MESSAGE_DELETE_WINDOW_SECONDS;
+    const history = await env.STATE.get<TrackedMessage[]>("message_history", "json") ?? [];
+    const latestId = ctx.message?.message_id;
+    if (latestId === undefined) return;
+    const inferredIds = Array.from(
+      { length: Math.min(latestId, MESSAGE_SWEEP_LIMIT) },
+      (_, index) => latestId - index,
+    );
+    const trackedIds = history.filter((message) => message.date > cutoff).map((message) => message.id);
+    const ids = [...new Set([...inferredIds, ...trackedIds])].sort((a, b) => b - a);
+    for (let index = 0; index < ids.length; index += 100) {
+      await ctx.deleteMessages(ids.slice(index, index + 100)).catch(() => {});
+    }
+    await env.STATE.write({}, ["message_history", "login_state", "pin_state", "result_access"]);
   });
 
   bot.command("login", async (ctx) => {
@@ -153,11 +263,24 @@ export function createBot(env: BotEnv): Bot {
 
   bot.command("logout", async (ctx) => {
     await env.STATE.write({}, ACCOUNT_STATE_KEYS);
-    await ctx.reply("Logged out. Your saved password has been deleted.");
+    await ctx.reply("Logged out and deleted your saved password. Send /login when you want to connect again.");
+  });
+
+  bot.command("setpin", async (ctx) => {
+    await env.STATE.write({}, ["login_state", "pin_state", "result_access"]);
+    await env.STATE.put(
+      "pin_state",
+      JSON.stringify({ action: "set" } satisfies PinState),
+      { expirationTtl: PIN_TIMEOUT_SECONDS },
+    );
+    await ctx.reply("Send a new 4 to 12 digit PIN. I'll delete your message after reading it.");
   });
 
   bot.command("results", (ctx) => askPin(ctx, "results"));
   bot.command("summary", (ctx) => askPin(ctx, "summary"));
+  bot.command("analytics", (ctx) => askPin(ctx, "analytics"));
+  bot.command("compare", (ctx) => askPin(ctx, "compare"));
+  bot.command("report", (ctx) => askPin(ctx, "report"));
 
   // Plain-text messages are either a PIN, or part of a /login conversation.
   bot.on("message:text", async (ctx, next) => {
@@ -171,13 +294,37 @@ export function createBot(env: BotEnv): Bot {
       // Best effort: remove the PIN from the chat. Telegram may refuse, which is fine.
       await ctx.deleteMessage().catch(() => {});
 
-      if (text !== env.PIN) {
-        await ctx.reply("Wrong PIN. Send /results or /summary to try again.");
+      if (pin.action === "set") {
+        if (!/^\d{4,12}$/.test(text)) {
+          await env.STATE.put("pin_state", JSON.stringify(pin), { expirationTtl: PIN_TIMEOUT_SECONDS });
+          await ctx.reply("PIN must contain 4 to 12 digits. Try again.");
+          return;
+        }
+        await env.STATE.put("pin_digest", await digestPin(env.ENCRYPTION_KEY, text));
+        if (pin.target) {
+          const destination = pin.target === "results" ? "semester results"
+            : pin.target === "summary" ? "academic summary"
+            : pin.target === "analytics" ? "academic trend"
+            : pin.target === "compare" ? "semester comparison"
+            : "academic report";
+          await ctx.reply(`PIN saved. Loading your ${destination} now.`);
+          await showProtected(ctx, pin.target);
+        } else {
+          const session = await env.STATE.get<Session>("session", "json");
+          await ctx.reply(session
+            ? "PIN saved. Next, send /results to browse by semester, /compare for the cumulative breakdown, /report for a PDF, or /analytics for trends."
+            : "PIN saved. Next, send /login to connect your portal account.");
+        }
         return;
       }
 
-      if (pin.action === "results") await showResults(ctx);
-      else await showSummary(ctx);
+      const configured = await env.STATE.get("pin_digest");
+      if (!configured || await digestPin(env.ENCRYPTION_KEY, text) !== configured) {
+        await ctx.reply("Wrong PIN. Send /results, /summary, /compare, /report, or /analytics to try again.");
+        return;
+      }
+
+      await showProtected(ctx, pin.target);
       return;
     }
 
@@ -223,11 +370,11 @@ export function createBot(env: BotEnv): Bot {
     const courses = key === undefined ? undefined : results[key];
 
     if (!key || !courses) {
-      await ctx.editMessageText("That semester is no longer on the portal.");
+      await ctx.editMessageText("That semester is no longer on the portal. Send /refresh, then open /results again.");
       return;
     }
 
-    const pages = semesterPages(key, courses);
+    const pages = semesterPages(key, courses, results);
     const page = Number(ctx.match[2]);
     if (!pages[page]) return;
     const navigation = [];
@@ -259,7 +406,7 @@ export function createBot(env: BotEnv): Bot {
 
   bot.command("refresh", async (ctx) => {
     const { fetchedAt } = await refreshResults(env);
-    await ctx.reply(`Results refreshed at ${formatTime(fetchedAt)}.`);
+    await ctx.reply(`Results refreshed at ${formatTime(fetchedAt)}. Next, send /results to browse by semester, /compare for the cumulative breakdown, /report for a PDF, or /analytics for trends.`);
   });
 
   bot.command("status", async (ctx) => {
@@ -283,6 +430,9 @@ export function createBot(env: BotEnv): Bot {
         ? `Last check: ${formatTime(lastCheck.at)} - ${lastCheck.ok ? "OK" : `failed: ${escapeHtml(lastCheck.error ?? "unknown error")}`}`
         : "Last check: none yet",
       "Automatic checks run every 15 minutes.",
+      session
+        ? "Next: send /refresh, /results, /compare, /report, /summary, or /analytics."
+        : "Next: send /login to connect your account.",
     ];
 
     await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
